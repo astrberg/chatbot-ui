@@ -7,7 +7,8 @@ import { Overview } from "@/components/custom/overview";
 import { Header } from "@/components/custom/header";
 import {v4 as uuidv4} from 'uuid';
 
-const socket = new WebSocket("ws://localhost:8090"); //change to your websocket endpoint
+const url = import.meta.env.VITE_BACKEND_URL || "ws://localhost:3000";
+const socket = new WebSocket(url);
 
 export function Chat() {
   const [messagesContainerRef, messagesEndRef] = useScrollToBottom<HTMLDivElement>();
@@ -28,27 +29,46 @@ async function handleSubmit(text?: string) {
   if (!socket || socket.readyState !== WebSocket.OPEN || isLoading) return;
 
   const messageText = text || question;
+  const token = localStorage.getItem("google_id_token"); // Retrieve the token from localStorage
+
   setIsLoading(true);
   cleanupMessageHandler();
-  
+
   const traceId = uuidv4();
   setMessages(prev => [...prev, { content: messageText, role: "user", id: traceId }]);
-  socket.send(messageText);
   setQuestion("");
+
+  if (!token) {
+    // Add the unauthorized message to the chat
+    setMessages(prev => [
+      ...prev,
+      { content: "Unauthorized. Please login...", role: "assistant", id: uuidv4() }
+    ]);
+    setIsLoading(false);
+    cleanupMessageHandler();
+    return;
+  }
+
+  const payload = {
+    message: messageText,
+    token: token,
+  };
+
+  socket.send(JSON.stringify(payload));
 
   try {
     const messageHandler = (event: MessageEvent) => {
       setIsLoading(false);
-      if(event.data.includes("[END]")) {
+      if (event.data.includes("[END]")) {
         return;
       }
-      
+
       setMessages(prev => {
         const lastMessage = prev[prev.length - 1];
-        const newContent = lastMessage?.role === "assistant" 
-          ? lastMessage.content + event.data 
+        const newContent = lastMessage?.role === "assistant"
+          ? lastMessage.content + event.data
           : event.data;
-        
+
         const newMessage = { content: newContent, role: "assistant", id: traceId };
         return lastMessage?.role === "assistant"
           ? [...prev.slice(0, -1), newMessage]
