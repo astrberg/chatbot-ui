@@ -15,8 +15,8 @@ ENV PIP_USER=1
 ENV PYTHONUSERBASE=/app/.local
 ENV PATH="/app/.local/bin:$PATH"
 
-RUN python3.12 -m pip install --no-cache-dir aiohttp websockets google-auth requests
+RUN python3.12 -m pip install --no-cache-dir aiohttp google-auth requests fastapi uvicorn[standard]
 
 COPY main.py auth.py /app/
 
-CMD ["python3.12", "main.py"]
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "49152", "--log-level", "info"]

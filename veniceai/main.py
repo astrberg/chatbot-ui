@@ -1,27 +1,44 @@
 import os
 import aiohttp
-import asyncio
-import websockets
 import logging
 import json
-from websockets import serve, ServerConnection, Request
-import http
-
+from fastapi import (
+    FastAPI,
+    WebSocket,
+    WebSocketDisconnect,
+    HTTPException,
+    status,
+)
+from aiohttp import ClientSession, ClientError
+from contextlib import asynccontextmanager
+from fastapi.middleware.cors import CORSMiddleware
 from auth import verify_token
 
-PORT = int(os.environ.get("PORT"))
-if not PORT:
-    raise ValueError("PORT is not set.")
+life = {}
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    life["session"] = aiohttp.ClientSession()
+    yield
+    await life["session"].close()
+
+app = FastAPI(lifespan=lifespan)
 
 ALLOWED_ORIGIN = os.environ.get("ALLOWED_ORIGIN")
 if not ALLOWED_ORIGIN:
     raise ValueError("ALLOWED_ORIGIN is not set.")
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[ALLOWED_ORIGIN],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 ALLOWED_USERS = os.environ.get("ALLOWED_USERS").split(",")
 if not ALLOWED_USERS:
     raise ValueError("ALLOWED_USERS is not set.")
-
-logging.basicConfig(level=logging.INFO)
 
 
 def read_content(data) -> str:
@@ -32,110 +49,118 @@ def read_content(data) -> str:
         return "Error, could not read content. Please try again."
 
 
-async def send_request(message: str):
+async def send_request(message: str, session: ClientSession) -> dict:
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                os.environ["VENICE_API_URL"],
-                json={
-                    "model": os.environ["VENICE_API_MODEL"],
-                    "messages": [{"role": "user", "content": message}],
-                    "venice_parameters": {
-                        "enable_web_search": "on",
-                        "include_venice_system_prompt": True,
-                    },
-                    "frequency_penalty": 0,
-                    "presence_penalty": 0,
-                    "max_tokens": 1000,
-                    "max_completion_tokens": 998,
-                    "temperature": 1,
-                    "top_p": 0.1,
-                    "stream": False,
+        async with session.post(
+            os.environ["VENICE_API_URL"],
+            json={
+                "model": os.environ["VENICE_API_MODEL"],
+                "messages": [{"role": "user", "content": message}],
+                "venice_parameters": {
+                    "enable_web_search": "on",
+                    "include_venice_system_prompt": True,
                 },
-                headers={"Authorization": f"Bearer {os.environ['VENICE_API_KEY']}"},
-            ) as response:
-                response.raise_for_status()
-                response_json = await response.json()
-                return response_json
-    except aiohttp.ClientError as e:
+                "frequency_penalty": 0,
+                "presence_penalty": 0,
+                "max_tokens": 1000,
+                "max_completion_tokens": 998,
+                "temperature": 1,
+                "top_p": 0.1,
+                "stream": False,
+            },
+            headers={"Authorization": f"Bearer {os.environ['VENICE_API_KEY']}"},
+        ) as response:
+            response.raise_for_status()
+            response_json = await response.json()
+            return response_json
+    except ClientError as e:
         logging.error(f"Error: {e}")
         return None
     except Exception as e:
         return None
 
 
-async def send_response(websocket: ServerConnection, response: str):
-    try:
-        await websocket.send(response)
-        await websocket.send("[END]")
-    except Exception as e:
-        return None
-
-
-async def handle_message(websocket: ServerConnection, message: str):
+async def handle_message(websocket: WebSocket, message: str, session: ClientSession):
+    """
+    Handle incoming WebSocket messages and send responses.
+    """
     try:
         data = json.loads(message)
         token = data.get("token")
         user_message = data.get("message")
 
         if not token or not user_message:
-            await send_response(websocket, "Unauthorized.")
+            await websocket.send_text("Unauthorized.")
+            await websocket.send_text("[END]")
             return
 
         user_info = await verify_token(token, ALLOWED_USERS)
         if not user_info:
-            await send_response(websocket, "Unauthorized.")
+            await websocket.send_text("Unauthorized.")
+            await websocket.send_text("[END]")
             return
 
-        response = await send_request(user_message)
+        response = await send_request(user_message, session)
         if response is None:
-            await send_response(websocket, "Error processing the message.")
+            await websocket.send_text("Error processing the message.")
+            await websocket.send_text("[END]")
             return
 
         content = read_content(response)
-        await send_response(websocket, content)
+        await websocket.send_text(content)
+        await websocket.send_text("[END]")
         logging.info(f"User: {user_info['email']}, Message: {user_message}")
         logging.info(f"Response: {content}")
     except json.JSONDecodeError:
-        await send_response(websocket, "Invalid message format.")
+        await websocket.send_text("Invalid message format.")
+        await websocket.send_text("[END]")
         logging.error("Invalid message format from client.")
-        return
 
 
-async def echo(websocket: ServerConnection):
+async def verify_connection(websocket: WebSocket):
+    await websocket.accept()
+
     try:
-        async for message in websocket:
-            await handle_message(websocket, message)
-    except websockets.exceptions.ConnectionClosed:
-        return None
+        initial_message = await websocket.receive_text()
+        data = json.loads(initial_message)
+        token = data.get("token")
+
+        if not token:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Missing token",
+            )
+
+        user_info = await verify_token(token, ALLOWED_USERS)
+        if not user_info:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid or expired token",
+            )
+
+        logging.info(f"WebSocket connection established for user: {user_info['email']}")
+        return user_info
+    except Exception as e:
+        logging.error(f"Error during token verification: {e}")
+        await websocket.close()
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or expired token",
+        )
+
+
+@app.websocket("/ws-1994")
+async def websocket_endpoint(websocket: WebSocket):
+    """
+    WebSocket endpoint to handle client connections.
+    """
+    try:
+        _ = await verify_connection(websocket)
+        session = life["session"]
+        while True:
+            message = await websocket.receive_text()
+            await handle_message(websocket, message, session)
+    except WebSocketDisconnect:
+        logging.info("WebSocket connection closed.")
     except Exception as e:
         logging.error(f"Error: {e}")
-        return None
-
-
-async def process_request(connection: ServerConnection, request: Request):
-    """
-    Handle non-WebSocket HTTP requests.
-
-    If the request is not a valid WebSocket handshake, return an HTTP response.
-    """
-    if "Upgrade" not in request.headers or request.headers["Upgrade"].lower() != "websocket":
-        response = connection.respond(
-            http.HTTPStatus.OK,
-            "OK"
-        )
-        return response
-
-    # Return None to continue with the WebSocket handshake
-    return None
-
-async def main():
-    async with serve(
-        echo, "0.0.0.0", PORT, origins=[ALLOWED_ORIGIN], process_request=process_request
-    ):
-        logging.info(f"WebSocket server started on port: {PORT}")
-        await asyncio.Future()  # run forever
-
-
-if __name__ == "__main__":
-    asyncio.run(main())

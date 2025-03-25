@@ -1,9 +1,9 @@
 import os
 from google.oauth2 import id_token
 from google.auth.transport import requests
-import logging
 
 CLIENT_ID = os.environ["VITE_GOOGLE_CLIENT_ID"]
+
 
 async def verify_token(token: str, allowed_users: list):
     """
@@ -26,6 +26,5 @@ async def verify_token(token: str, allowed_users: list):
             raise ValueError("Unauthorized user.")
 
         return payload
-    except ValueError as e:
-        logging.error(f"Token verification failed: {e}")
+    except ValueError:
         return None
