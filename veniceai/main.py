@@ -16,11 +16,13 @@ from auth import verify_token
 
 life = {}
 
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     life["session"] = aiohttp.ClientSession()
     yield
     await life["session"].close()
+
 
 app = FastAPI(lifespan=lifespan)
 
@@ -49,13 +51,13 @@ def read_content(data) -> str:
         return "Error, could not read content. Please try again."
 
 
-async def send_request(message: str, session: ClientSession) -> dict:
+async def send_request(context: list, session: ClientSession) -> dict:
     try:
         async with session.post(
             os.environ["VENICE_API_URL"],
             json={
                 "model": os.environ["VENICE_API_MODEL"],
-                "messages": [{"role": "user", "content": message}],
+                "messages": context,
                 "venice_parameters": {
                     "enable_web_search": "on",
                     "include_venice_system_prompt": True,
@@ -80,7 +82,9 @@ async def send_request(message: str, session: ClientSession) -> dict:
         return None
 
 
-async def handle_message(websocket: WebSocket, message: str, session: ClientSession):
+async def handle_message(
+    websocket: WebSocket, message: str, session: ClientSession, context: list
+):
     """
     Handle incoming WebSocket messages and send responses.
     """
@@ -100,13 +104,18 @@ async def handle_message(websocket: WebSocket, message: str, session: ClientSess
             await websocket.send_text("[END]")
             return
 
-        response = await send_request(user_message, session)
+        context.append({"role": "user", "content": user_message})
+
+        response = await send_request(context, session)
         if response is None:
             await websocket.send_text("Error processing the message.")
             await websocket.send_text("[END]")
             return
 
         content = read_content(response)
+
+        context.append({"role": "assistant", "content": content})
+
         await websocket.send_text(content)
         await websocket.send_text("[END]")
         logging.info(f"User: {user_info['email']}, Message: {user_message}")
@@ -157,9 +166,10 @@ async def websocket_endpoint(websocket: WebSocket):
     try:
         _ = await verify_connection(websocket)
         session = life["session"]
+        context = []
         while True:
             message = await websocket.receive_text()
-            await handle_message(websocket, message, session)
+            await handle_message(websocket, message, session, context)
     except WebSocketDisconnect:
         logging.info("WebSocket connection closed.")
     except Exception as e:
